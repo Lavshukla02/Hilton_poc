@@ -1,0 +1,134 @@
+# ================= DELTA ONLY SCRIPT =================
+
+$scriptPath = "C:\Omega\Scripts\Invoke-SqlStoredProcToJson.ps1"
+
+$server = 'AUBNESSQL09'
+$database = 'hf_omega'
+$username = 'extractAccount'
+$password = 'ExtractingDataForExternalAnalysis,Bob'
+
+$baseData = "C:\Omega\Data"
+$baseLogs = "C:\Omega\Logs"
+
+# ================= DATASETS =================
+$datasets = @{
+    "Articles"           = "extract.GetArticles"
+    "ProductionOrders"   = "extract.GetProductionOrders"
+    "ProducedPackages"   = "extract.GetProducedPackages"
+    "ProducedCrates"     = "extract.GetProducedCrates"
+    "RejectedPackages"   = "extract.GetRejectedPackages"
+    "RejectedCrates"     = "extract.GetRejectedCrates"
+    "GetDowntimes"       = "extract.GetDowntimes"
+}
+
+# ================= HASH FUNCTION =================
+function Get-Hash($row) {
+    $json = $row | ConvertTo-Json -Compress -Depth 10
+    $bytes = [System.Text.Encoding]::UTF8.GetBytes($json)
+    $hash = [System.Security.Cryptography.SHA256]::Create().ComputeHash($bytes)
+    return ([BitConverter]::ToString($hash) -replace "-", "")
+}
+
+# ================= PROCESS =================
+foreach ($dataset in $datasets.Keys) {
+
+    $sp = $datasets[$dataset]
+
+    Write-Host "Processing delta for $dataset..."
+
+    try {
+        $datasetPath = "$baseData\$dataset"
+        $tempFile    = "$datasetPath\temp.json"
+        $stateFile   = "$datasetPath\state.json"
+        $deltaDir    = "$datasetPath\delta"
+        $logPath     = "$baseLogs\$dataset.log"
+
+        # Ensure folders
+        if (!(Test-Path $datasetPath)) { New-Item -ItemType Directory -Path $datasetPath -Force | Out-Null }
+        if (!(Test-Path $deltaDir))    { New-Item -ItemType Directory -Path $deltaDir -Force | Out-Null }
+
+        # ================= FETCH CURRENT DATA =================
+        & $scriptPath `
+            -Server $server `
+            -Database $database `
+            -Username $username `
+            -PasswordPlain $password `
+            -StoredProcedure $sp `
+            -OutputPath $tempFile `
+            -LogPath $logPath
+
+        if (!(Test-Path $tempFile)) {
+            Write-Host "No temp file for $dataset"
+            continue
+        }
+
+        $data = Get-Content $tempFile -Raw | ConvertFrom-Json
+
+        if (-not $data) {
+            Write-Host "No data returned for $dataset"
+            continue
+        }
+
+        # ================= LOAD STATE =================
+        $state = @{}
+        if (Test-Path $stateFile) {
+            try {
+                $raw = Get-Content $stateFile -Raw | ConvertFrom-Json
+                foreach ($i in $raw) {
+                    $state[$i.Key] = $i.Value
+                }
+            } catch {
+                Write-Host "State corrupted → resetting"
+                $state = @{}
+            }
+        }
+
+        # ================= DELTA LOGIC =================
+        $delta = @()
+        $newState = @{}
+
+        foreach ($row in $data) {
+
+            # Generic key (first column)
+            $key = $row.PSObject.Properties.Value[0]
+
+            if (-not $key) { continue }
+
+            $hash = Get-Hash $row
+            $newState[$key] = $hash
+
+            if (-not $state.ContainsKey($key) -or $state[$key] -ne $hash) {
+                $delta += $row
+            }
+        }
+
+        # ================= WRITE DELTA =================
+        if ($delta.Count -gt 0) {
+
+            $timestamp = (Get-Date).ToString("yyyy-MM-dd_HH-mm-ss")
+            $deltaFile = "$deltaDir\${dataset}_delta_$timestamp.json"
+
+            $delta | ConvertTo-Json -Depth 20 | Set-Content $deltaFile -Encoding utf8
+
+            Write-Host "Delta created: $deltaFile"
+        }
+        else {
+            Write-Host "No delta changes for $dataset"
+        }
+
+        # ================= SAVE STATE =================
+        $newState.GetEnumerator() | ForEach-Object {
+            [PSCustomObject]@{
+                Key   = $_.Key
+                Value = $_.Value
+            }
+        } | ConvertTo-Json -Depth 5 | Set-Content $stateFile
+
+    }
+    catch {
+        Write-Host "ERROR in $dataset : $($_.Exception.Message)"
+    }
+}
+
+Write-Host "========================================"
+Write-Host "DELTA EXECUTION COMPLETED"
